@@ -88,6 +88,8 @@ class Stats:
     errors: int = 0
     queued: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
+    error_types: dict = field(default_factory=dict)
+    _shown_errors: set = field(default_factory=set)
 
     def increment_downloaded(self):
         with self.lock:
@@ -97,9 +99,20 @@ class Stats:
         with self.lock:
             self.skipped += 1
 
-    def increment_errors(self):
+    def add_error(self, category: str, path: str, detail: str = ""):
         with self.lock:
             self.errors += 1
+            if category not in self.error_types:
+                self.error_types[category] = []
+            self.error_types[category].append((path, detail))
+
+    def should_show_error(self, category: str) -> bool:
+        """Return True if this error category hasn't been shown yet."""
+        with self.lock:
+            if category not in self._shown_errors:
+                self._shown_errors.add(category)
+                return True
+            return False
 
     def set_queued(self, count: int):
         with self.lock:
@@ -205,8 +218,12 @@ class GitDumper:
             return self.user_agent
         return random.choice(USER_AGENTS)
 
-    def _download_file(self, path: str) -> Optional[bytes]:
-        """Download a single file from the git directory."""
+    def _download_file(self, path: str) -> tuple:
+        """Download a single file from the git directory.
+
+        Returns (content, error_category, error_detail) tuple.
+        On success: (bytes, None, None). On failure: (None, category, detail).
+        """
         url = urljoin(self.base_url, path)
 
         try:
@@ -216,16 +233,23 @@ class GitDumper:
             )
 
             if response.status_code == 200:
-                return response.content
+                return (response.content, None, None)
             elif response.status_code == 404:
                 self.logger.debug(f"Not found: {path}")
+                return (None, "HTTP 404 (Not Found)", "")
             else:
                 self.logger.debug(f"HTTP {response.status_code} for {path}")
+                return (None, f"HTTP {response.status_code}", "")
 
+        except requests.exceptions.ConnectionError as e:
+            self.logger.debug(f"Connection error for {path}: {e}")
+            return (None, "Connection Error", str(e)[:120])
+        except requests.exceptions.Timeout:
+            self.logger.debug(f"Timeout for {path}")
+            return (None, "Timeout", f">{self.timeout}s")
         except requests.exceptions.RequestException as e:
             self.logger.debug(f"Error downloading {path}: {e}")
-
-        return None
+            return (None, "Request Error", str(e)[:120])
 
     def _save_file(self, path: str, content: bytes) -> bool:
         """Save downloaded content to a file."""
@@ -459,6 +483,39 @@ class GitDumper:
         for file_path in new_files:
             self._queue_file(file_path)
 
+    def _print_error(self, progress: Progress, category: str, path: str, detail: str = ""):
+        """Print a styled error line for the first occurrence of each error category."""
+        ERROR_STYLES = {
+            "HTTP 404 (Not Found)": ("dim red", "?"),
+            "Connection Error": ("bold red", "!"),
+            "Timeout": ("yellow", "~"),
+            "Save Failed": ("bold magenta", "!"),
+            "Worker Exception": ("bold red", "!"),
+            "Request Error": ("red", "!"),
+        }
+        # Match HTTP status codes generically
+        if category.startswith("HTTP ") and category not in ERROR_STYLES:
+            style, icon = ("red", "x")
+        else:
+            style, icon = ERROR_STYLES.get(category, ("red", "x"))
+
+        if self.stats.should_show_error(category):
+            detail_str = f" - {detail}" if detail else ""
+            count_later = ""
+        else:
+            # For repeated categories, only show every 10th to avoid spam
+            with self.stats.lock:
+                cat_count = len(self.stats.error_types.get(category, []))
+            if cat_count <= 5 or cat_count % 25 == 0:
+                detail_str = f" - {detail}" if detail else ""
+                count_later = f" [dim](#{cat_count})[/dim]"
+            else:
+                return
+
+        progress.console.print(
+            f"  [{style}]{icon} {category}[/{style}]: {path}{detail_str}{count_later}"
+        )
+
     def _worker(self, progress: Progress, task: TaskID):
         """Worker thread for downloading files."""
         while True:
@@ -487,7 +544,7 @@ class GitDumper:
                         pass
                 else:
                     # Download the file
-                    content = self._download_file(path)
+                    content, err_cat, err_detail = self._download_file(path)
 
                     if content is not None:
                         if self._save_file(path, content):
@@ -497,13 +554,15 @@ class GitDumper:
                             self._process_file(path, content)
                             self.logger.debug(f"Downloaded: {path}")
                         else:
-                            self.stats.increment_errors()
+                            self.stats.add_error("Save Failed", path, "Could not write file to disk")
+                            self._print_error(progress, "Save Failed", path, "Could not write file to disk")
                     else:
-                        self.stats.increment_errors()
+                        self.stats.add_error(err_cat, path, err_detail)
+                        self._print_error(progress, err_cat, path, err_detail)
 
             except Exception as e:
-                self.logger.debug(f"Worker error for {path}: {e}")
-                self.stats.increment_errors()
+                self.stats.add_error("Worker Exception", path, str(e)[:120])
+                self._print_error(progress, "Worker Exception", path, str(e)[:120])
             finally:
                 self.file_queue.task_done()
                 self.stats.set_queued(self.file_queue.qsize())
@@ -578,6 +637,25 @@ class GitDumper:
             console.print(f"  Downloaded: {self.stats.downloaded}")
             console.print(f"  Skipped: {self.stats.skipped}")
             console.print(f"  Errors: {self.stats.errors}")
+
+            if self.stats.error_types:
+                console.print()
+                console.print("[bold red]Error breakdown:[/bold red]")
+                for category, entries in sorted(
+                    self.stats.error_types.items(),
+                    key=lambda x: len(x[1]),
+                    reverse=True,
+                ):
+                    count = len(entries)
+                    console.print(f"  [red]{category}[/red]: {count}")
+                    # Show up to 3 example paths for each category
+                    examples = entries[:3]
+                    for path, detail in examples:
+                        detail_str = f" ({detail})" if detail else ""
+                        console.print(f"    [dim]- {path}{detail_str}[/dim]")
+                    if count > 3:
+                        console.print(f"    [dim]... and {count - 3} more[/dim]")
+
             console.print()
             console.print(f"[dim]Try running 'cd {self.output_dir} && git checkout .' to restore files[/dim]")
 
