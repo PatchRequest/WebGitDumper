@@ -151,7 +151,10 @@ class GitDumper:
         path = parsed.path.rstrip("/")
 
         if not path.endswith(".git"):
-            path = path + "/.git" if path else ".git"
+            if path:
+                path = path + "/.git"
+            else:
+                path = "/.git"
 
         return f"{parsed.scheme}://{parsed.netloc}{path}/"
 
