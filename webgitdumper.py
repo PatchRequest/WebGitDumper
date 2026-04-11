@@ -6,12 +6,15 @@ For authorized security testing, CTF challenges, and educational purposes only.
 """
 
 import hashlib
+import json
 import logging
 import os
 import queue
 import random
 import re
+import shutil
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -134,6 +137,7 @@ class GitDumper:
         verify_ssl: bool = True,
         verbose: bool = False,
         quiet: bool = False,
+        scan_secrets: bool = False,
     ):
         self.base_url = self._normalize_url(url)
         self.output_dir = Path(output_dir)
@@ -145,6 +149,7 @@ class GitDumper:
         self.verify_ssl = verify_ssl
         self.verbose = verbose
         self.quiet = quiet
+        self.scan_secrets = scan_secrets
 
         self.stats = Stats()
         self.downloaded_files: Set[str] = set()
@@ -659,6 +664,79 @@ class GitDumper:
             console.print()
             console.print(f"[dim]Try running 'cd {self.output_dir} && git checkout .' to restore files[/dim]")
 
+        if self.scan_secrets:
+            self._scan_secrets()
+
+    def _scan_secrets(self):
+        """Run trufflehog against the dumped repository to find secrets in history."""
+        if not (self.output_dir / ".git").exists():
+            console.print("[red]Cannot scan: no .git directory found[/red]")
+            return
+
+        binary = shutil.which("trufflehog")
+        if not binary:
+            console.print()
+            console.print("[yellow]⚠ trufflehog not found in PATH — skipping secret scan[/yellow]")
+            console.print("[dim]Install: brew install trufflehog  |  https://github.com/trufflesecurity/trufflehog[/dim]")
+            return
+
+        console.print()
+        console.print("[bold blue]Scanning for secrets with trufflehog...[/bold blue]")
+
+        repo_uri = f"file://{self.output_dir.resolve()}"
+        cmd = [binary, "git", repo_uri, "--json", "--no-update", "--no-verification"]
+
+        findings = []
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    findings.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            proc.wait()
+        except FileNotFoundError:
+            console.print("[red]trufflehog binary disappeared during execution[/red]")
+            return
+        except Exception as e:
+            console.print(f"[red]trufflehog failed: {e}[/red]")
+            return
+
+        if not findings:
+            console.print("[green]✓ No secrets found[/green]")
+            return
+
+        console.print(
+            f"[bold red]Found {len(findings)} potential secret(s)[/bold red]"
+            f" [dim](verification disabled — manual review required)[/dim]"
+        )
+        console.print()
+
+        for f in findings:
+            detector = f.get("DetectorName", "Unknown")
+            raw = f.get("Raw", "")
+            redacted = (raw[:60] + "…") if len(raw) > 60 else raw
+
+            meta = f.get("SourceMetadata", {}).get("Data", {}).get("Git", {})
+            commit = meta.get("commit", "")[:10]
+            file_path = meta.get("file", "")
+            line_num = meta.get("line", "")
+
+            console.print(f"  [red]●[/red] [bold]{detector}[/bold]")
+            if file_path:
+                loc = f"{file_path}:{line_num}" if line_num else file_path
+                console.print(f"    [dim]{loc} @ {commit}[/dim]")
+            console.print(f"    [dim]{redacted}[/dim]")
+
 
 @click.command()
 @click.argument("url")
@@ -671,6 +749,7 @@ class GitDumper:
 @click.option("--no-verify", is_flag=True, help="Disable SSL verification")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--quiet", "-q", is_flag=True, help="Minimal output")
+@click.option("--scan-secrets", is_flag=True, help="Run trufflehog against the dumped repo after download")
 def main(
     url: str,
     output_dir: str,
@@ -682,6 +761,7 @@ def main(
     no_verify: bool,
     verbose: bool,
     quiet: bool,
+    scan_secrets: bool,
 ):
     """
     WebGitDumper - Download exposed .git directories from web servers.
@@ -709,6 +789,7 @@ def main(
             verify_ssl=not no_verify,
             verbose=verbose,
             quiet=quiet,
+            scan_secrets=scan_secrets,
         )
         dumper.run()
     except KeyboardInterrupt:
