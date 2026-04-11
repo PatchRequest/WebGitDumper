@@ -15,6 +15,7 @@ A Python tool for downloading exposed `.git` directories from web servers.
 - **Timeout handling** - Configurable connection/read timeouts
 - **SSL verification toggle** - Option to disable for self-signed certificates
 - **Smart discovery** - Automatically discovers and downloads git objects by parsing refs, index, pack files, and object contents
+- **Secret scanning** - Optional post-download scan with [trufflehog](https://github.com/trufflesecurity/trufflehog) across the full git history
 
 ## Installation
 
@@ -61,6 +62,7 @@ Options:
   --no-verify              Disable SSL verification
   -v, --verbose            Verbose output
   -q, --quiet              Minimal output
+  --scan-secrets           Run trufflehog against the dumped repo after download
   --help                   Show this message and exit
 ```
 
@@ -87,7 +89,25 @@ python webgitdumper.py http://target.com/.git/ ./repo --verbose
 
 # Quiet mode (errors only)
 python webgitdumper.py http://target.com/.git/ ./repo --quiet
+
+# Scan dumped repo for secrets across the full git history
+python webgitdumper.py http://target.com/.git/ ./repo --scan-secrets
 ```
+
+### Secret Scanning
+
+With `--scan-secrets`, WebGitDumper invokes [trufflehog](https://github.com/trufflesecurity/trufflehog)
+against the dumped `.git` directory after the download finishes. The scan covers the
+**entire commit history**, not just the current tree — old commits often hold the most
+interesting leaks.
+
+Verification is **explicitly disabled** (`--no-verification`) so trufflehog never sends
+discovered credentials to third-party APIs. This avoids leaking secrets to upstream
+providers, triggering alerts at the target, or leaving traces in external logs.
+Findings must be reviewed manually.
+
+Requires the `trufflehog` binary in `PATH` (`brew install trufflehog`). If not present,
+the scan is skipped with a warning instead of failing.
 
 ### After Downloading
 
